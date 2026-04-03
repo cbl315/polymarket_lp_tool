@@ -117,6 +117,73 @@ def fetch_collateral_snapshot(client: Any, open_orders: list[dict]) -> Optional[
     )
 
 
+def fetch_positions_current_value_sum_usdc(
+    user_address: str,
+    data_api_host: str,
+    *,
+    limit: int = 500,
+    max_pages: int = 25,
+) -> tuple[Optional[float], str]:
+    """
+    Sum ``currentValue`` from Data API ``GET /positions`` (portfolio mark, USDC).
+
+    This is **not** included in CLOB ``balance-allowance`` collateral; Polymarket UI
+    "portfolio" total is typically CLOB USDC + position current values.
+
+    Returns ``(None, reason)`` on failure, ``(0.0, \"\")`` if no positions, else ``(sum, \"\")``.
+    """
+    host = data_api_host.rstrip("/")
+    user = str(user_address).strip()
+    if not user:
+        return None, "empty user address"
+    total = 0.0
+    offset = 0
+    for _ in range(max(1, max_pages)):
+        url = f"{host}/positions?user={user}&limit={int(limit)}&offset={int(offset)}"
+        try:
+            rows = http_json("GET", url)
+        except Exception as e:
+            LOG.warning("positions currentValue sum failed: %s", e)
+            return None, str(e)[:200]
+        if not isinstance(rows, list):
+            return None, "positions API returned non-list"
+        for p in rows:
+            if not isinstance(p, dict):
+                continue
+            try:
+                cv = p.get("currentValue")
+                if cv is None or str(cv).strip() == "":
+                    continue
+                total += max(0.0, float(cv))
+            except (TypeError, ValueError):
+                continue
+        if len(rows) < limit:
+            break
+        offset += limit
+    return float(total), ""
+
+
+def combine_clob_and_positions_market_value_usdc(
+    clob_total_usdc: float,
+    funder_address: str,
+    data_api_host: str,
+) -> tuple[float, Optional[float], str]:
+    """
+    Portfolio total ≈ CLOB collateral + sum(Data API position ``currentValue``).
+
+    Returns ``(portfolio_total, positions_sum_or_None, error_if_positions_failed)``.
+    When positions fetch fails, ``portfolio_total == clob_total_usdc`` and
+    ``positions_sum_or_None is None``.
+    """
+    c = max(0.0, float(clob_total_usdc))
+    ps, err = fetch_positions_current_value_sum_usdc(
+        str(funder_address).strip(), data_api_host
+    )
+    if ps is None:
+        return c, None, err
+    return c + max(0.0, float(ps)), float(ps), ""
+
+
 def fetch_total_deposited_from_activity(
     user_address: str,
     data_api_host: str,

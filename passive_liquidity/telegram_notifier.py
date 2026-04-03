@@ -19,6 +19,29 @@ LOG = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
+
+def _maybe_log_supergroup_migration(error_body: str) -> None:
+    """
+    Telegram returns 400 with migrate_to_chat_id when a group was upgraded to supergroup.
+    Old TELEGRAM_CHAT_ID stops working; user must update .env to the new id.
+    """
+    try:
+        data = json.loads(error_body)
+    except json.JSONDecodeError:
+        return
+    params = data.get("parameters")
+    if not isinstance(params, dict):
+        return
+    new_id = params.get("migrate_to_chat_id")
+    if new_id is None:
+        return
+    LOG.error(
+        "Telegram：当前 TELEGRAM_CHAT_ID 已失效（群已升级为超级群）。"
+        "请把 .env 中 TELEGRAM_CHAT_ID 改为: %s  然后重启程序。"
+        "命令轮询与推送都依赖该 ID。",
+        new_id,
+    )
+
 # Status strings (Telegram copy)
 SCORING_STATUS_ON = "获取积分中"
 SCORING_STATUS_OFF = "未获取积分"
@@ -152,6 +175,55 @@ class TelegramNotifier:
     def account_label(self) -> str:
         return self._account_label
 
+    @property
+    def bot_token(self) -> str:
+        return self._bot_token
+
+    @property
+    def chat_id(self) -> str:
+        return self._chat_id
+
+    def send_command_reply(self, text: str) -> None:
+        """
+        Reply to /status, /orders, etc. Bypasses cooldown and dedupe so each command
+        gets a fresh message. Runs synchronously (caller should be a background thread).
+        """
+        if not self._enabled:
+            return
+        token = self._bot_token
+        chat = self._chat_id
+        url = TELEGRAM_API.format(token=token)
+        body = json.dumps(
+            {"chat_id": chat, "text": text, "disable_web_page_preview": True},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw) if raw else {}
+            if not data.get("ok"):
+                _maybe_log_supergroup_migration(raw)
+                LOG.warning("Telegram command reply not ok: %s", raw[:400])
+            else:
+                LOG.info("Telegram command reply sent ok (%d chars)", len(text))
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = str(e)
+            _maybe_log_supergroup_migration(err_body)
+            LOG.warning(
+                "Telegram command reply HTTPError: %s %s", e.code, err_body[:400]
+            )
+        except Exception as e:
+            LOG.warning("Telegram command reply failed: %s", e)
+
     def should_notify(self, event_key: str, payload_hash: str) -> bool:
         """True if we may send (not duplicate fingerprint; cooldown ok)."""
         with self._lock:
@@ -217,6 +289,7 @@ class TelegramNotifier:
                     err_body = e.read().decode("utf-8", errors="replace")
                 except Exception:
                     err_body = str(e)
+                _maybe_log_supergroup_migration(err_body)
                 LOG.warning("Telegram HTTPError key=%s: %s %s", event_key, e.code, err_body[:300])
             except Exception as e:
                 LOG.warning("Telegram send failed key=%s: %s", event_key, e)
@@ -346,7 +419,14 @@ class TelegramNotifier:
         locked_open_buy_usdc: float,
         pnl_usdc: Optional[float],
         extra_note_zh: str = "",
+        clob_collateral_usdc: Optional[float] = None,
+        positions_market_value_usdc: Optional[float] = None,
+        positions_error_zh: str = "",
     ) -> None:
+        """
+        ``total_account_usdc`` = portfolio total (CLOB + positions ``currentValue``) when
+        breakdown is passed; otherwise legacy CLOB-only total.
+        """
         if deposited_reference_usdc is None:
             ref_line = "累计入账（参考）: 未配置"
             pnl_line = "盈亏（相对入账参考）: 暂不计算（需先配置入账参考）"
@@ -359,11 +439,25 @@ class TelegramNotifier:
             f"[{self._account_label}]",
             "事件: 程序启动 · 账户资金快照",
             ref_line,
-            f"当前账户总额: {total_account_usdc:.4f} USDC",
-            f"当前可用余额: {available_balance_usdc:.4f} USDC",
-            f"未成交买单占用: {locked_open_buy_usdc:.4f} USDC",
-            pnl_line,
+            f"当前账户总额（组合≈）: {total_account_usdc:.4f} USDC",
         ]
+        if clob_collateral_usdc is not None:
+            lines.append(f"CLOB 抵押 USDC: {float(clob_collateral_usdc):.4f} USDC")
+            if positions_market_value_usdc is not None:
+                lines.append(
+                    f"持仓市值（Data API）: {float(positions_market_value_usdc):.4f} USDC"
+                )
+            elif (positions_error_zh or "").strip():
+                lines.append(
+                    f"持仓市值: （未计入：{(positions_error_zh or '').strip()[:120]}）"
+                )
+        lines.extend(
+            [
+                f"当前可用余额（CLOB 可开新单≈）: {available_balance_usdc:.4f} USDC",
+                f"未成交买单占用: {locked_open_buy_usdc:.4f} USDC",
+                pnl_line,
+            ]
+        )
         if (extra_note_zh or "").strip():
             lines.append((extra_note_zh or "").strip())
         text = "\n".join(lines)
@@ -379,6 +473,9 @@ class TelegramNotifier:
         available_balance_usdc: float,
         deposited_reference_usdc: Optional[float],
         pnl_usdc: Optional[float],
+        clob_collateral_usdc: Optional[float] = None,
+        positions_market_value_usdc: Optional[float] = None,
+        positions_error_zh: str = "",
     ) -> None:
         if deposited_reference_usdc is None:
             ref_line = "入账参考: 未配置"
@@ -391,11 +488,25 @@ class TelegramNotifier:
         lines = [
             f"[{self._account_label}]",
             f"定期摘要（半点/整点 · {time_label}）",
-            f"账户总额: {total_account_usdc:.4f} USDC",
-            f"可用余额: {available_balance_usdc:.4f} USDC",
-            ref_line,
-            pnl_line,
+            f"账户总额（组合≈）: {total_account_usdc:.4f} USDC",
         ]
+        if clob_collateral_usdc is not None:
+            lines.append(f"CLOB 抵押: {float(clob_collateral_usdc):.4f} USDC")
+            if positions_market_value_usdc is not None:
+                lines.append(
+                    f"持仓市值: {float(positions_market_value_usdc):.4f} USDC"
+                )
+            elif (positions_error_zh or "").strip():
+                lines.append(
+                    f"持仓市值: （未计入：{(positions_error_zh or '').strip()[:100]}）"
+                )
+        lines.extend(
+            [
+                f"可用余额（CLOB≈）: {available_balance_usdc:.4f} USDC",
+                ref_line,
+                pnl_line,
+            ]
+        )
         text = "\n".join(lines)
         fp = stable_fingerprint("periodic", slot_key, text)
         self.send_message(text, event_key=f"periodic:summary:{slot_key}", payload_hash=fp)

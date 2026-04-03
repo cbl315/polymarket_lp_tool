@@ -3,7 +3,10 @@
 Python **监控与调价**程序：您在 [Polymarket](https://docs.polymarket.com/api-reference/introduction) 前端**手动挂单**，本程序**不会新建订单**，只轮询该 API 密钥下的**未成交订单**，按**订单簿 + 激励半宽 δ** 的**简化规则**做 **保持 / 撤单 / 同量改价重挂**。
 
 这不是自动做市机器人。
+
 @臭臭Panda 推特/X ： https://x.com/Chosmos110
+
+如果不介意，欢迎使用作者的PolyMarket注册链接 ： https://polymarket.com/?r=xiaochouchou
 ## 当前策略概要（主循环）
 
 1. **白名单**：若设置 `PASSIVE_TOKEN_WHITELIST`，则仅以环境变量为准（运行中不随挂单变化）。若未设置，则从当前未成交单提取 `token_id`，并默认每 **120 秒**（`PASSIVE_WHITELIST_REFRESH_SEC`）用未成交单刷新，以便启动后新挂的单可被纳入；设为 `0` 则仅在启动时种子一次。
@@ -122,7 +125,9 @@ cp .env.example .env
 
 另有成交通知相关 `PASSIVE_TELEGRAM_NOTIFY_*`（见 `config_manager.py`）。
 
-**资金快照**：总额与可用均为 **CLOB API collateral**；未成交买单占用单独**估算展示**，**不加回**总额。改价挂单失败、撤单失败等会发**中文运营警告**（含余额不足等常见错误的简要说明）。
+**群组 → 超级群**：Telegram 会更换 `chat_id`。若发消息报 `group chat was upgraded to a supergroup`，请按接口返回的 **`migrate_to_chat_id`** 更新 **`TELEGRAM_CHAT_ID`** 并重启（否则推送与 `/status` 等命令都不会进新群）。
+
+**资金快照**：周期摘要里总额与可用均为 **CLOB API collateral**。**Telegram `/status`、`/pnl`** 中的「组合总额」为 **CLOB 抵押 USDC + Data API 持仓 `currentValue` 合计**（与前端「组合」口径更接近；若 positions 拉取失败则仅显示 CLOB）。未成交买单占用单独**估算展示**。改价挂单失败、撤单失败等会发**中文运营警告**（含余额不足等常见错误的简要说明）。
 
 ## 运行
 

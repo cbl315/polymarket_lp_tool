@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Optional
 
 from passive_liquidity.account_portfolio import (
+    combine_clob_and_positions_market_value_usdc,
     fetch_collateral_snapshot,
     half_hour_slot_key,
     read_optional_deposit_env,
@@ -49,6 +51,7 @@ from passive_liquidity.simple_price_policy import (
     decide_simple_price,
     format_eligible_band_depth_summary_zh,
 )
+from passive_liquidity.telegram_command_poller import start_telegram_command_poller
 from passive_liquidity.telegram_notifier import (
     OrderEventFormat,
     TelegramNotifier,
@@ -290,7 +293,17 @@ def main() -> None:
         LOG.warning("Startup balance snapshot: open orders unavailable: %s", e)
         bal_orders = []
     snap0 = fetch_collateral_snapshot(client, bal_orders)
-    startup_total = float(snap0.total_balance_usdc) if snap0 else 0.0
+    if snap0:
+        portfolio0, pos0_val, pos0_err = combine_clob_and_positions_market_value_usdc(
+            snap0.total_balance_usdc,
+            funder,
+            config.data_api_host,
+        )
+        startup_total = float(portfolio0)
+    else:
+        pos0_val = None
+        pos0_err = ""
+        startup_total = 0.0
     deposited_baseline, deposit_source_zh, deposit_approximate = resolve_deposit_reference(
         polygon_summary=polygon_summary,
         env_override=env_dep,
@@ -317,14 +330,15 @@ def main() -> None:
         pnl0 = (
             None
             if deposited_baseline is None
-            else snap0.total_balance_usdc - deposited_baseline
+            else float(startup_total) - float(deposited_baseline)
         )
         LOG.debug(
-            "account snapshot (startup): api_account_total=%.6f api_collateral=%.6f "
-            "locked_amount_in_open_orders=%.6f computed_available_balance=%.6f "
+            "account snapshot (startup): portfolio_total=%.6f clob_collateral=%.6f "
+            "positions_mkt=%s locked_amount_in_open_orders=%.6f computed_available_balance=%.6f "
             "deposited_reference=%s computed_pnl=%s",
+            float(startup_total),
             snap0.total_balance_usdc,
-            snap0.api_collateral_usdc,
+            f"{pos0_val:.6f}" if pos0_val is not None else "None",
             snap0.locked_open_buy_usdc,
             snap0.available_balance_usdc,
             f"{deposited_baseline:.6f}" if deposited_baseline is not None else "None",
@@ -335,8 +349,8 @@ def main() -> None:
             extra_note = (polygon_summary.note_zh or "").strip()
         elif deposited_baseline is None:
             extra_note = (
-                "说明: 未自动取得累计入账参考。当前账户总额≠历史累计充值，"
-                "请勿混用。请在 .env 设置 TELEGRAM_TOTAL_DEPOSITED_USDC，"
+                "说明: 未自动取得累计入账参考。「组合总额」为 CLOB+持仓市值，"
+                "与历史累计充值不是同一概念。请在 .env 设置 TELEGRAM_TOTAL_DEPOSITED_USDC，"
                 "或配置 POLYGONSCAN_API_KEY；也可尝试 Bridge API 是否包含您的入账。"
             )
         elif "Bridge API" in deposit_source_zh:
@@ -349,11 +363,14 @@ def main() -> None:
         if telegram.enabled:
             telegram.notify_account_startup(
                 deposited_reference_usdc=deposited_baseline,
-                total_account_usdc=snap0.total_balance_usdc,
+                total_account_usdc=float(startup_total),
                 available_balance_usdc=snap0.available_balance_usdc,
                 locked_open_buy_usdc=snap0.locked_open_buy_usdc,
                 pnl_usdc=pnl0,
                 extra_note_zh=extra_note,
+                clob_collateral_usdc=snap0.total_balance_usdc,
+                positions_market_value_usdc=pos0_val,
+                positions_error_zh=pos0_err if pos0_val is None else "",
             )
     elif telegram.enabled:
         LOG.warning(
@@ -377,6 +394,15 @@ def main() -> None:
     monitor_alert_gate = PassiveMonitorAlertGate(config)
     next_band_summary_at = time.time() + max(
         1.0, float(config.telegram_band_summary_interval_sec)
+    )
+
+    telegram_command_stop = threading.Event()
+    start_telegram_command_poller(
+        notifier=telegram,
+        client=client,
+        order_manager=order_manager,
+        funder=funder,
+        stop=telegram_command_stop,
     )
 
     class _WsSubRef:
@@ -542,18 +568,26 @@ def main() -> None:
                     last_summary_slot = slot
                     snap_p = fetch_collateral_snapshot(client, orders)
                     if snap_p:
+                        port_p, pos_p_val, pos_p_err = (
+                            combine_clob_and_positions_market_value_usdc(
+                                snap_p.total_balance_usdc,
+                                funder,
+                                config.data_api_host,
+                            )
+                        )
                         pnl_p = (
                             None
                             if deposited_baseline is None
-                            else snap_p.total_balance_usdc - deposited_baseline
+                            else float(port_p) - float(deposited_baseline)
                         )
                         LOG.debug(
-                            "account summary (periodic): api_account_total=%.6f "
-                            "api_collateral=%.6f locked_amount_in_open_orders=%.6f "
-                            "computed_available_balance=%.6f deposit_reference_source=%s "
-                            "deposited_reference=%s computed_pnl=%s",
+                            "account summary (periodic): portfolio_total=%.6f "
+                            "clob_collateral=%.6f positions_mkt=%s "
+                            "locked_amount_in_open_orders=%.6f computed_available_balance=%.6f "
+                            "deposit_reference_source=%s deposited_reference=%s computed_pnl=%s",
+                            float(port_p),
                             snap_p.total_balance_usdc,
-                            snap_p.api_collateral_usdc,
+                            f"{pos_p_val:.6f}" if pos_p_val is not None else "None",
                             snap_p.locked_open_buy_usdc,
                             snap_p.available_balance_usdc,
                             deposit_source_zh,
@@ -569,10 +603,13 @@ def main() -> None:
                         telegram.notify_periodic_account_summary(
                             slot_key=slot,
                             time_label=time_label,
-                            total_account_usdc=snap_p.total_balance_usdc,
+                            total_account_usdc=float(port_p),
                             available_balance_usdc=snap_p.available_balance_usdc,
                             deposited_reference_usdc=deposited_baseline,
                             pnl_usdc=pnl_p,
+                            clob_collateral_usdc=snap_p.total_balance_usdc,
+                            positions_market_value_usdc=pos_p_val,
+                            positions_error_zh=pos_p_err if pos_p_val is None else "",
                         )
                     else:
                         LOG.warning("Telegram periodic summary skipped (no collateral data)")
@@ -1261,6 +1298,7 @@ def main() -> None:
 
             error_streak = 0
         except KeyboardInterrupt:
+            telegram_command_stop.set()
             LOG.info("Interrupted; exiting.")
             break
         except Exception as e:
